@@ -1,9 +1,9 @@
 # docsme
 
-> A simple CLI tool to [describe what your tool actually does]
+A simple CLI tool which structures git commits accross all your projects, by contributor, to produce per-person reports on contribution activity accross a specified timeframe. If you have an AI agent configured locally (cursor-cli, claude) the `--use-agent` flag can be passed for elaboration.  
 
-![GitHub release](https://img.shields.io/github/v/release/yourname/docsme)
-![License](https://img.shields.io/github/license/yourname/docsme)
+![GitHub release](https://img.shields.io/github/v/release/lramos0/docsme)
+![License](https://img.shields.io/github/license/lramos0/docsme)
 ![Shell](https://img.shields.io/badge/built%20with-bash-1f425f.svg)
 
 ---
@@ -22,13 +22,13 @@
 Install the latest version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yourname/docsme/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lramos0/docsme/main/install.sh | bash
 ```
 
 Install a specific version:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yourname/docsme/main/install.sh | bash -s -- v1.0.0
+curl -fsSL https://raw.githubusercontent.com/lramos0/docsme/main/install.sh | bash -s -- v1.0.0
 ```
 
 ---
@@ -50,7 +50,7 @@ docsme
 ## 🔄 Update
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/yourname/docsme/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/lramos0/docsme/main/install.sh | bash
 ```
 
 ---
@@ -68,7 +68,7 @@ sudo rm /usr/local/bin/docsme
 Clone the repo:
 
 ```bash
-git clone https://github.com/yourname/docsme.git
+git clone https://github.com/lramos0/docsme.git
 cd docsme
 ```
 
