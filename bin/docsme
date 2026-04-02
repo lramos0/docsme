@@ -1,0 +1,412 @@
+#!/usr/bin/env bash
+# Independent implementation parallel to docsme-py (same CLI + behavior by convention).
+# No shared source with docsme-py; update this file and docsme-py separately when changing behavior.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+docsme — bash implementation (CLI and output aligned with docsme-py)
+
+Usage:
+  docsme ROOT_DIR --username USERNAME [options]
+
+Required:
+  ROOT_DIR                    Root directory to scan for git repos
+  --username USERNAME         Passed to git as --author= (same as Python)
+
+Options:
+  --since TEXT                Git --since (default: 1 year ago)
+  --until TEXT                Git --until (optional; omit if not set)
+  --output FILE               Output file (default: docsme_report.md)
+  --agent cursor|claude       Embedded in handoff prompt; only cursor runs CLI (default: cursor)
+  --run-agent                 Run Cursor agent; output matches Python final_report
+  --cursor-trust, --trust     Pass --trust to the Cursor CLI
+  --cursor-bin CMD            Cursor binary preference (default: agent)
+  --cursor-mode ask|plan      (default: ask)
+  --model MODEL               Optional --model for Cursor
+  --help                      This help
+
+Examples:
+  docsme ~/projects --username "logan"
+  docsme ~/projects --username "logan" --run-agent --cursor-trust
+EOF
+}
+
+err() {
+  echo "docsme: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || err "missing required command: $1"
+}
+
+# Same discovery idea as docsme.core.find_git_repos
+find_git_repos() {
+  local root="$1"
+  find "$root" -type d -name .git -prune 2>/dev/null | while read -r gitdir; do
+    dirname "$gitdir"
+  done | sort -u
+}
+
+# Collect commits: git --author= + optional --since/--until (like docsme.core.run_git_log).
+# TSV columns: repo_name, author_date, commit_hash, author_name, author_email, subject, body
+collect_commits_tsv() {
+  local root="$1" author="$2" since="${3:-}" until="${4:-}" out="$5"
+  : > "$out"
+
+  local git_since=() git_until=()
+  [[ -n "$since" ]] && git_since=(--since="$since")
+  [[ -n "$until" ]] && git_until=(--until="$until")
+
+  while read -r repo; do
+    [[ -n "$repo" ]] || continue
+    local repo_name
+    repo_name="$(basename "$repo")"
+
+    git -C "$repo" log \
+      --author="$author" \
+      "${git_since[@]}" \
+      "${git_until[@]}" \
+      --all \
+      --date=iso-strict \
+      --pretty=format:'%H%x1f%aI%x1f%an%x1f%ae%x1f%s%x1f%b%x1e' 2>/dev/null \
+      | awk -v repo="$repo_name" -v RS="$(printf '\036')" -v FS="$(printf '\037')" '
+          NF >= 6 {
+            h=$1; d=$2; an=$3; ae=$4; s=$5; b=$6
+            gsub(/\r/, " ", b); gsub(/\n/, " ", b)
+            gsub(/\t/, " ", b)
+            gsub(/\r/, " ", s); gsub(/\n/, " ", s)
+            gsub(/\t/, " ", s)
+            if (length(b) > 160) b = substr(b, 1, 160)
+            print repo "\t" d "\t" h "\t" an "\t" ae "\t" s "\t" b
+          }
+        ' >> "$out" || true
+  done < <(find_git_repos "$root")
+}
+
+# --- stats (mirror summarize_dataframe) ---
+stat_total() { awk 'NF {n++} END{print n+0}' "$1"; }
+stat_repos() { cut -f1 "$1" | sort -u | awk 'NF{n++} END{print n+0}'; }
+
+stat_date_min_max() {
+  awk -F'\t' 'NF>=2 && $2!="" {print $2}' "$1" | sort | awk '
+    NR==1 {min=$0}
+    {max=$0}
+    END {
+      if (NR==0) print ""
+      else if (NR==1) { print min; print min }
+      else { print min; print max }
+    }'
+}
+
+stat_top_repos() {
+  # Avoid `sort | head | …` under pipefail: head often exits 141 (SIGPIPE) and aborts the script.
+  awk -F'\t' 'NF {c[$1]++} END {for (r in c) print r "\t" c[r]}' "$1" \
+    | sort -t$'\t' -k2,2nr -k1,1 | awk 'NR<=10'
+}
+
+stat_top_days() {
+  awk -F'\t' 'NF>=2 && $2!="" { split($2, a, "T"); day[a[1]]++ }
+    END {for (d in day) print d "\t" day[d]}' "$1" \
+    | sort -t$'\t' -k2,2nr -k1,1 | awk 'NR<=10'
+}
+
+format_top_repo_lines() {
+  local f="$1"
+  if [[ ! -s "$f" ]]; then echo "- None"; return; fi
+  while IFS=$'\t' read -r repo cnt; do
+    [[ -n "$repo" ]] || continue
+    echo "- ${repo}: ${cnt} commits"
+  done < "$f"
+}
+
+format_top_day_lines() {
+  local f="$1"
+  if [[ ! -s "$f" ]]; then echo "- None"; return; fi
+  while IFS=$'\t' read -r day cnt; do
+    [[ -n "$day" ]] || continue
+    echo "- ${day}: ${cnt} commits"
+  done < "$f"
+}
+
+# Markdown table: author_date (date), repo_name, subject, body, commit_hash (8 chars), max rows
+markdown_table_prompt_sample() {
+  local commits_file="$1" max_rows="$2"
+  sort -t$'\t' -k2,2r "$commits_file" | awk -v max="$max_rows" -F'\t' '
+    BEGIN {
+      print "| author_date | repo_name | subject | body | commit_hash |"
+      print "| --- | --- | --- | --- | --- |"
+      n = 0
+    }
+    NF >= 7 && n < max {
+      n++
+      d=$2; gsub(/T.*/, "", d)
+      subj=$6; gsub(/\|/, "\\|", subj)
+      bod=$7; gsub(/\|/, "\\|", bod)
+      h=substr($3,1,8)
+      repo=$1; gsub(/\|/, "\\|", repo)
+      printf "| %s | %s | %s | %s | %s |\n", d, repo, subj, bod, h
+    }
+  '
+}
+
+# Preview table: author_date, repo_name, subject, commit_hash (8) — docsme.core.generate_report_markdown
+markdown_table_preview() {
+  local commits_file="$1"
+  sort -t$'\t' -k2,2r "$commits_file" | awk -v max=50 -F'\t' '
+    BEGIN {
+      print "| author_date | repo_name | subject | commit_hash |"
+      print "| --- | --- | --- | --- |"
+      n = 0
+    }
+    NF >= 7 && n < max {
+      n++
+      d=$2; gsub(/T.*/, "", d)
+      subj=$6; gsub(/\|/, "\\|", subj)
+      h=substr($3,1,8)
+      repo=$1; gsub(/\|/, "\\|", repo)
+      printf "| %s | %s | %s | %s |\n", d, repo, subj, h
+    }
+  '
+}
+
+# build_analysis_prompt + generate_report_markdown (docsme.core)
+generate_base_report_markdown() {
+  local commits_file="$1" username="$2" root="$3" agent="$4" lookback_label="$5" out="$6"
+  local fence=$'\x60\x60\x60'
+
+  local total repos
+  total=$(stat_total "$commits_file")
+  repos=$(stat_repos "$commits_file")
+
+  local drange_start drange_end
+  drange_start=""
+  drange_end=""
+  if [[ "$total" -gt 0 ]]; then
+    {
+      read -r drange_start
+      read -r drange_end
+    } < <(stat_date_min_max "$commits_file")
+  fi
+
+  local top_repos_f top_days_f
+  top_repos_f="$(mktemp)"
+  top_days_f="$(mktemp)"
+  stat_top_repos "$commits_file" > "$top_repos_f"
+  stat_top_days "$commits_file" > "$top_days_f"
+
+  local top_repo_lines top_day_lines
+  top_repo_lines="$(format_top_repo_lines "$top_repos_f")"
+  top_day_lines="$(format_top_day_lines "$top_days_f")"
+  rm -f "$top_repos_f" "$top_days_f"
+
+  local commit_table
+  if [[ "$total" -eq 0 ]]; then
+    commit_table="_No matching commits found._"
+  else
+    commit_table="$(markdown_table_prompt_sample "$commits_file" 75)"
+  fi
+
+  local drange_for_prompt
+  if [[ -n "$drange_start" ]]; then
+    drange_for_prompt="{'start': '${drange_start}', 'end': '${drange_end}'}"
+  else
+    drange_for_prompt="None"
+  fi
+
+  local inner_f inner_prompt
+  inner_f="$(dirname "$commits_file")/handoff_inner.txt"
+  # Write via heredoc to a file (not $(<<HERE)) so newlines are preserved; matches docsme.core.build_analysis_prompt.
+  cat >"$inner_f" <<INNER_EOF
+You are ${agent}. I need you to analyze a developer's Git activity and produce a polished markdown report describing what they did over the last ${lookback_label}.
+
+## Instructions
+- Infer the main projects, themes, and responsibilities from the commit history.
+- Focus on outcomes and patterns, not just raw commit counts.
+- Call out likely areas of ownership, technical depth, and cross-project impact.
+- Be honest about uncertainty. Commit messages are noisy and incomplete.
+- Avoid inventing specifics not grounded in the data.
+- Structure the final answer as a markdown report with these sections:
+  1. Executive Summary
+  2. Major Projects / Repos
+  3. Main Themes of Work
+  4. Evidence-Based Highlights
+  5. What Is Unclear / Missing
+  6. Suggested Resume / Self-Review Bullet Points
+
+## Developer
+- Username filter used: ${username}
+
+## Aggregate Stats
+- Total commits: ${total}
+- Repos touched: ${repos}
+- Date range: ${drange_for_prompt}
+
+## Top Repositories
+${top_repo_lines}
+
+## Most Active Days
+${top_day_lines}
+
+## Sample Commit Data
+${commit_table}
+
+Now write the markdown report.
+
+INNER_EOF
+  inner_prompt=$(cat "$inner_f")
+
+  {
+    printf -- "# docsme report for \`%s\`\n\n" "$username"
+    echo "- Agent target: **${agent}**"
+    printf -- "- Root scanned: \`%s\`\n" "$root"
+    echo "- Commits found: **${total}**"
+    echo "- Repositories touched: **${repos}**"
+    if [[ -n "$drange_start" ]]; then
+      echo "- Date range: **${drange_start}** -> **${drange_end}**"
+    fi
+    echo ""
+    echo "## Handoff Prompt"
+    echo ""
+    printf '%s\n' "${fence}text"
+    printf '%s\n' "$inner_prompt"
+    printf '%s\n' "$fence"
+    echo ""
+    echo "## Raw Commit Preview"
+    echo ""
+    if [[ "$total" -eq 0 ]]; then
+      echo "_No matching commits found._"
+    else
+      markdown_table_preview "$commits_file"
+    fi
+  } > "$out"
+}
+
+# docsme.core.build_cursor_report_prompt — written around full base report
+write_cursor_agent_input() {
+  local username="$1" base_report_file="$2" out="$3"
+  {
+    printf '%s\n\n' "You are helping refine a developer activity report."
+    printf "The following document was produced by docsme for \`%s\`. It includes aggregate stats, a handoff prompt, and a commit preview.\n\n" "$username"
+    printf '%s\n\n' "Task:"
+    printf '%s\n' "1. Read the handoff instructions embedded in the document (inside the fenced Handoff Prompt block)."
+    printf '%s\n' "2. Produce a single polished markdown report that follows those instructions, grounded in the commit data shown."
+    printf '%s\n\n' "3. Output only the final report markdown (no preamble or meta-commentary)."
+    printf '%s\n\n' "---"
+    cat "$base_report_file"
+  } > "$out"
+}
+
+# docsme.core.run_cursor_agent (stdin = prompt text)
+run_cursor_agent() {
+  local prompt_file="$1" cursor_bin="$2" mode="$3" model="${4:-}" workdir="$5" trust="${6:-false}"
+
+  local bin=""
+  if command -v "$cursor_bin" >/dev/null 2>&1; then
+    bin="$cursor_bin"
+  elif command -v agent >/dev/null 2>&1; then
+    bin="agent"
+  elif command -v cursor-agent >/dev/null 2>&1; then
+    bin="cursor-agent"
+  else
+    err "could not find Cursor CLI (tried: $cursor_bin, agent, cursor-agent)"
+  fi
+
+  local -a cmd
+  cmd=("$bin" --print --mode "$mode" --output-format text)
+  [[ -n "$model" ]] && cmd+=(--model "$model")
+  [[ "$trust" == "true" ]] && cmd+=(--trust)
+
+  ( cd "$workdir" && "${cmd[@]}" < "$prompt_file" )
+}
+
+main() {
+  require_cmd git
+  require_cmd find
+  require_cmd awk
+  require_cmd sort
+  require_cmd mktemp
+  require_cmd head
+
+  [[ $# -ge 1 ]] || { usage; exit 1; }
+
+  local root="" username="" since="" until="" output="docsme_report.md"
+  local agent="cursor" run_agent="false" cursor_trust="false"
+  local cursor_bin="agent" cursor_mode="ask" model=""
+
+  root="$1"
+  shift || true
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --username) username="${2:-}"; shift 2 ;;
+      --since) since="${2:-}"; shift 2 ;;
+      --until) until="${2:-}"; shift 2 ;;
+      --output) output="${2:-}"; shift 2 ;;
+      --agent) agent="${2:-}"; shift 2 ;;
+      --run-agent) run_agent="true"; shift ;;
+      --cursor-trust|--trust) cursor_trust="true"; shift ;;
+      --cursor-bin) cursor_bin="${2:-}"; shift 2 ;;
+      --cursor-mode) cursor_mode="${2:-}"; shift 2 ;;
+      --model) model="${2:-}"; shift 2 ;;
+      --help|-h) usage; exit 0 ;;
+      *) err "unknown argument: $1" ;;
+    esac
+  done
+
+  [[ -d "$root" ]] || err "root directory does not exist: $root"
+  [[ -n "$username" ]] || err "--username is required"
+  [[ "$agent" == "cursor" || "$agent" == "claude" ]] || err "--agent must be cursor or claude"
+
+  local root_abs
+  root_abs="$(cd "$root" && pwd -P)"
+
+  [[ -z "$since" ]] && since="1 year ago"
+
+  local tmpdir
+  tmpdir="$(mktemp -d)"
+  # Expand path when registering the trap (nested function + set -u breaks on EXIT).
+  trap "rm -rf \"$tmpdir\"" EXIT
+
+  local commits_file report_file cursor_input agent_out
+  commits_file="$tmpdir/commits.tsv"
+  report_file="$tmpdir/base_report.md"
+  cursor_input="$tmpdir/cursor_in.txt"
+  agent_out="$tmpdir/agent_out.txt"
+
+  echo "docsme: collecting commits (git --author)..." >&2
+  collect_commits_tsv "$root_abs" "$username" "$since" "$until" "$commits_file"
+
+  generate_base_report_markdown "$commits_file" "$username" "$root_abs" "$agent" "year" "$report_file"
+
+  if [[ "$run_agent" == "true" ]]; then
+    if [[ "$agent" != "cursor" ]]; then
+      err "--run-agent only supports --agent cursor"
+    fi
+    write_cursor_agent_input "$username" "$report_file" "$cursor_input"
+    echo "docsme: running Cursor agent -> ${output} ..." >&2
+    set +e
+    run_cursor_agent "$cursor_input" "$cursor_bin" "$cursor_mode" "$model" "$root_abs" "$cursor_trust" > "$agent_out"
+    local st=$?
+    set -e
+    [[ "$st" -eq 0 ]] || err "Cursor CLI failed (exit $st). Try --cursor-trust or run agent interactively once."
+    [[ -s "$agent_out" ]] || err "Cursor CLI returned empty output."
+
+    {
+      echo "# docsme report"
+      echo ""
+      echo "Generated for **${username}** using **Cursor**."
+      echo ""
+      echo "---"
+      echo ""
+      cat "$agent_out"
+    } > "$output"
+  else
+    cp "$report_file" "$output"
+  fi
+
+  echo "Wrote $output"
+}
+
+main "$@"
