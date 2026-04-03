@@ -1,11 +1,11 @@
 # docsme
 
 A simple CLI tool which structures git commits accross all your projects, by contributor, to produce per-person reports on contribution activity accross a specified timeframe. If you have an AI agent configured locally (cursor-cli, claude) the `--use-agent` flag can be passed for elaboration.  
-
 ![GitHub release](https://img.shields.io/github/v/release/lramos0/docsme)
 ![License](https://img.shields.io/github/license/lramos0/docsme)
 ![Shell](https://img.shields.io/badge/built%20with-bash-1f425f.svg)
 
+an independent distribution of docsme written in python is available [here](https://github.com/lramos0/docsme-py)
 ---
 
 ## ✨ Features
